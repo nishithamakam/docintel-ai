@@ -14,6 +14,10 @@ class Settings(BaseSettings):
     # Storage paths
     data_dir: str = "./data"
 
+    upload_dir: str = "data/uploads"
+    index_dir: str = "data/faiss_index"
+
+
     # RAG settings
     chunk_size: int = 800
     chunk_overlap: int = 100

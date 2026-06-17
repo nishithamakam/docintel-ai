@@ -1,159 +1,115 @@
 """
-Upload Endpoint - Accepts PDF files and processes them into the vector store.
-
-Flow:
-    1. Receive PDF file from user
-    2. Validate it's actually a PDF
-    3. Save to disk with a unique ID
-    4. Parse → Chunk → Embed → Store
-    5. Return summary of what was processed
-
-This is the "ingestion" phase of RAG — turning raw documents
-into searchable knowledge.
+Upload endpoint — accepts PDF or Word (.docx) files,
+runs the full ingestion pipeline, stores in FAISS.
 """
+import os
 import uuid
 import shutil
-from pathlib import Path
 
 from fastapi import APIRouter, UploadFile, File, HTTPException
 from pydantic import BaseModel
 
-from app.config import DATA_DIR, settings
-from app.ingestion.pdf_parser import parse_pdf
-from app.ingestion.chunker import chunk_pages
-from app.ingestion.embedder import embed_texts
-from app.storage.vector_store import store
+from app.config import settings
+from app.ingestion.pdf_parser  import parse_pdf
+from app.ingestion.docx_parser import parse_docx
+from app.ingestion.chunker     import chunk_pages
+from app.ingestion.embedder    import embed_texts
+from app.storage.vector_store  import store
 
-# APIRouter is like a mini FastAPI app
-# We collect related endpoints in a router, then attach to main app
 router = APIRouter()
 
+# Supported file types
+SUPPORTED_TYPES = {
+    "application/pdf":                                                      "pdf",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+    "application/msword":                                                   "docx",
+}
+SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".doc"}
 
-# ── Response Model ──────────────────────────────────────────
-# Pydantic model defining what our endpoint returns
-# This auto-generates API docs and validates our output
+
+# ── Response model ────────────────────────────────────────────────────────────
 class UploadResponse(BaseModel):
-    doc_id: str           # Unique ID for this document
-    filename: str         # Original filename
-    pages: int            # Number of non-empty pages found
-    chunks: int           # Number of chunks created
-    message: str          # Human-friendly summary
+    doc_id:   str
+    filename: str
+    file_type: str
+    pages:    int
+    chunks:   int
+    message:  str
 
 
-# ── Upload Endpoint ──────────────────────────────────────────
-@router.post(
-    "/upload",
-    response_model=UploadResponse,
-    summary="Upload a PDF document",
-    description="Upload a PDF file to be parsed, chunked, embedded and stored for Q&A",
-)
-async def upload_pdf(
-    file: UploadFile = File(..., description="A PDF file to upload"),
-):
+# ── Endpoint ──────────────────────────────────────────────────────────────────
+@router.post("/upload", response_model=UploadResponse)
+async def upload_file(file: UploadFile = File(...)):
     """
-    Upload and process a PDF file.
+    Upload a PDF or Word document.
 
-    Steps performed:
-    1. Validate file is a PDF
-    2. Save to uploads folder with unique ID
-    3. Parse PDF into pages
-    4. Split pages into overlapping chunks
-    5. Generate embeddings for each chunk
-    6. Store embeddings + metadata in FAISS vector store
+    Pipeline:
+        1. Validate file type
+        2. Save to disk
+        3. Parse into pages
+        4. Chunk pages into overlapping text windows
+        5. Embed chunks
+        6. Store in FAISS
+        7. Return summary
     """
 
-    # ── Step 1: Validate file type ───────────────────────────
-    # We check both the filename extension AND the content type
-    # Users can rename files, so we check both for safety
-    if not file.filename.lower().endswith(".pdf"):
+    # ── Step 1: Validate ──────────────────────────────────────────────────────
+    filename  = file.filename or ""
+    ext       = os.path.splitext(filename)[1].lower()
+
+    # Detect type from extension (more reliable than content-type from browser)
+    if ext == ".pdf":
+        file_type = "pdf"
+    elif ext in (".docx", ".doc"):
+        file_type = "docx"
+    else:
         raise HTTPException(
             status_code=400,
-            detail="Only PDF files are supported. Please upload a .pdf file."
+            detail=f"Unsupported file type '{ext}'. Please upload a PDF or Word (.docx) file.",
         )
 
-    # ── Step 2: Generate unique document ID ─────────────────
-    # uuid4() generates a random unique identifier like "a3f2c1d4-..."
-    # We take the first 8 characters for brevity (still unique enough)
-    doc_id = str(uuid.uuid4())[:8]
+    # ── Step 2: Save to disk ──────────────────────────────────────────────────
+    doc_id    = str(uuid.uuid4())[:8]
+    save_dir  = settings.upload_dir
+    os.makedirs(save_dir, exist_ok=True)
+    save_path = os.path.join(save_dir, f"{doc_id}_{filename}")
 
-    # Build the save path: data/uploads/abc12345_MyDoc.pdf
-    # We prefix with doc_id so files with the same name don't overwrite each other
-    safe_filename = f"{doc_id}_{file.filename}"
-    save_path = DATA_DIR / "uploads" / safe_filename
-
-    # ── Step 3: Save file to disk ────────────────────────────
-    # We read the uploaded file in chunks and write to disk
-    # This is memory-efficient for large files
     try:
-        with open(save_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+        with open(save_path, "wb") as f:
+            shutil.copyfileobj(file.file, f)
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to save file: {str(e)}"
-        )
-    finally:
-        # Always close the uploaded file to free resources
-        await file.close()
+        raise HTTPException(status_code=500, detail=f"Failed to save file: {e}")
 
-    # ── Step 4: Parse PDF ────────────────────────────────────
+    # ── Step 3: Parse ─────────────────────────────────────────────────────────
     try:
-        pages = parse_pdf(str(save_path))
+        if file_type == "pdf":
+            pages = parse_pdf(save_path)
+        else:
+            pages = parse_docx(save_path)
     except Exception as e:
-        # If parsing fails, clean up the saved file
-        save_path.unlink(missing_ok=True)
-        raise HTTPException(
-            status_code=422,
-            detail=f"Failed to parse PDF: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Failed to parse file: {e}")
 
     if not pages:
-        save_path.unlink(missing_ok=True)
-        raise HTTPException(
-            status_code=422,
-            detail="No readable text found in this PDF. It may be scanned/image-based."
-        )
+        raise HTTPException(status_code=400, detail="Document appears to be empty.")
 
-    # ── Step 5: Chunk pages ──────────────────────────────────
-    chunks = chunk_pages(
-        pages=pages,
-        doc_id=doc_id,
-        doc_name=file.filename,  # original name for citations
-    )
+    # ── Step 4: Chunk ─────────────────────────────────────────────────────────
+    doc_name = filename
+    chunks   = chunk_pages(pages, doc_id=doc_id, doc_name=doc_name)
 
     if not chunks:
-        save_path.unlink(missing_ok=True)
-        raise HTTPException(
-            status_code=422,
-            detail="Could not create chunks from this PDF."
-        )
+        raise HTTPException(status_code=400, detail="No text content found in document.")
 
-    # ── Step 6: Generate embeddings ──────────────────────────
-    try:
-        texts = [chunk["text"] for chunk in chunks]
-        vectors = embed_texts(texts)
-    except Exception as e:
-        save_path.unlink(missing_ok=True)
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to generate embeddings: {str(e)}"
-        )
+    # ── Step 5 & 6: Embed + Store ─────────────────────────────────────────────
+    texts      = [c["text"]      for c in chunks]
+    embeddings = embed_texts(texts)
+    store.add(embeddings, chunks)
 
-    # ── Step 7: Store in vector store ───────────────────────
-    try:
-        store.add(vectors, chunks)
-    except Exception as e:
-        save_path.unlink(missing_ok=True)
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to store embeddings: {str(e)}"
-        )
-
-    # ── Step 8: Return summary ───────────────────────────────
+    # ── Step 7: Return summary ────────────────────────────────────────────────
     return UploadResponse(
-        doc_id=doc_id,
-        filename=file.filename,
-        pages=len(pages),
-        chunks=len(chunks),
-        message=f"✅ Successfully processed '{file.filename}': {len(pages)} pages, {len(chunks)} chunks stored and ready for Q&A.",
+        doc_id    = doc_id,
+        filename  = filename,
+        file_type = file_type.upper(),
+        pages     = len(pages),
+        chunks    = len(chunks),
+        message   = f"✅ Successfully processed {filename}",
     )
