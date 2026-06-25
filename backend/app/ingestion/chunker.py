@@ -84,6 +84,7 @@ def chunk_pages(pages: List[Dict], doc_id: str, doc_name: str) -> List[Dict]:
                 "doc_id": doc_id,
                 "doc_name": doc_name,
                 "page_number": page["page_number"],
+                "section_kind": page.get("section_kind", "page"),
                 "text": text,
                 "token_count": len(window),
             })

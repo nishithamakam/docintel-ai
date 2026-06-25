@@ -45,6 +45,7 @@ def parse_pdf(file_path: str) -> List[Dict]:
                 "page_number": i + 1,  # +1 because humans count from 1, not 0
                 "text": text,
                 "char_count": len(text),
+                "section_kind": "page"
             })
 
     # Always close the file when done — releases memory

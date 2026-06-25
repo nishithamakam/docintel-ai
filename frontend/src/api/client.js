@@ -4,7 +4,7 @@ const API_BASE = 'http://localhost:8000/api'
 
 const apiClient = axios.create({
   baseURL: API_BASE,
-  timeout: 60000,
+  timeout: 300000,
 })
 
 export async function uploadPdf(file) {

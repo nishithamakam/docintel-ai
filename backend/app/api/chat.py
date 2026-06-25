@@ -1,129 +1,96 @@
 """
-Chat endpoint — receives a question, retrieves relevant chunks,
-calls GPT, returns a grounded answer with citations.
+Chat endpoint — uses the multi-agent orchestrator to answer questions.
+
+Pipeline (handled by orchestrator):
+    1. Retriever  → finds relevant chunks
+    2. Analyst    → extracts key facts
+    3. Reporter   → writes the final answer
+    4. Critic     → verifies answer faithfulness
+
+The endpoint itself is now thin — it just validates inputs,
+delegates to the orchestrator, and shapes the response.
 """
 from fastapi import APIRouter
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, Any, Dict
 
-from app.config import settings
-from app.ingestion.embedder import embed_texts
-from app.storage.vector_store import store
+from app.agents.orchestrator import run_pipeline
 
 router = APIRouter()
 
 
-# ── Request / Response models ─────────────────────────────────────────────────
+# ── Request / Response models ────────────────────────────────
 class Message(BaseModel):
-    role: str      # 'user' or 'assistant'
+    role: str        # 'user' or 'assistant'
     content: str
 
 
 class ChatRequest(BaseModel):
     question:  str
     history:   Optional[List[Message]] = []
-    doc_ids:   Optional[List[str]]     = None   # filter to specific docs
-    min_score: float                   = 0.25   # relevance threshold
+    doc_ids:   Optional[List[str]]     = None    # filter to specific docs
+    min_score: float                   = 0.25    # relevance threshold
 
 
 class SourceChunk(BaseModel):
     doc_name: str
     page:     int
+    location: str = ""
     snippet:  str
     score:    float
+
+
+class AgentStep(BaseModel):
+    agent:      str
+    icon:       str
+    summary:    str
+    details:    Optional[str] = None
+    duration_s: float
+
+
+class TrustReport(BaseModel):
+    faithful: bool
+    score:    float
+    issues:   List[str]
+    verdict:  str
 
 
 class ChatResponse(BaseModel):
     answer:       str
     sources:      List[SourceChunk]
+    agent_steps:  List[AgentStep]
+    trust:        TrustReport
+    timings:      Dict[str, float]
     chunks_found: int
 
 
-# ── Endpoint ──────────────────────────────────────────────────────────────────
+# ── Endpoint ──────────────────────────────────────────────────
 @router.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
     """
-    1. Embed the question
-    2. Search FAISS (with optional doc filter + score threshold)
-    3. Build a grounded prompt
-    4. Call GPT
-    5. Return answer + citations
+    Run the multi-agent pipeline and return the structured result.
     """
-    from openai import OpenAI
-
-    client = OpenAI(
-        api_key=settings.openai_api_key,
-        base_url=settings.openai_base_url,
+    # Convert history to plain dicts for the orchestrator
+    history_dicts = (
+        [{"role": m.role, "content": m.content} for m in req.history]
+        if req.history else []
     )
 
-    # ── Step 1: Embed the question ────────────────────────────────────────────
-    query_vector = embed_texts([req.question])
-
-    # ── Step 2: Retrieve relevant chunks ─────────────────────────────────────
-    chunks = store.search(
-        query_vector,
-        k=settings.top_k,
-        doc_ids=req.doc_ids,
-        min_score=req.min_score,
+    # Call the orchestrator — does all the heavy lifting
+    result = run_pipeline(
+        question  = req.question,
+        history   = history_dicts,
+        doc_ids   = req.doc_ids,
+        min_score = req.min_score,
+        top_k     = 5,
     )
 
-    # ── Step 3: Build context from retrieved chunks ───────────────────────────
-    if chunks:
-        context_parts = []
-        for i, chunk in enumerate(chunks, 1):
-            context_parts.append(
-                f"[Source {i}: {chunk['doc_name']}, Page {chunk['page_number']}]\n"
-                f"{chunk['text']}"
-            )
-
-        context = "\n\n---\n\n".join(context_parts)
-
-        system_prompt = (
-            "You are a helpful document assistant. "
-            "Answer the user's question using ONLY the provided document excerpts. "
-            "Always cite your sources as (Source N, Page X). "
-            "If the answer is not in the excerpts, say so clearly.\n\n"
-            f"Document excerpts:\n\n{context}"
-        )
-    else:
-        system_prompt = (
-            "You are a helpful document assistant. "
-            "No relevant document excerpts were found for this question. "
-            "Politely tell the user you couldn't find relevant information "
-            "in the uploaded documents."
-        )
-
-    # ── Step 4: Build message history for GPT ────────────────────────────────
-    messages = [{"role": "system", "content": system_prompt}]
-
-    for msg in (req.history or []):
-        messages.append({"role": msg.role, "content": msg.content})
-
-    messages.append({"role": "user", "content": req.question})
-
-    # ── Step 5: Call GPT ──────────────────────────────────────────────────────
-    response = client.chat.completions.create(
-        model=settings.chat_model,
-        messages=messages,
-        max_completion_tokens=1024,
-        temperature=0.2,
-    )
-
-    answer = response.choices[0].message.content
-
-    # ── Step 6: Build source list for frontend ────────────────────────────────
-    sources = [
-        SourceChunk(
-            doc_name=c["doc_name"],
-            page=c["page_number"],
-            snippet=c["text"][:300],
-            score=round(c["score"], 4),
-        )
-        for c in chunks
-    ]
-
+    # Shape into our response model
     return ChatResponse(
-        answer=answer,
-        sources=sources,
-        chunks_found=len(chunks),
+        answer       = result["answer"],
+        sources      = [SourceChunk(**s) for s in result["sources"]],
+        agent_steps  = [AgentStep(**s)   for s in result["agent_steps"]],
+        trust        = TrustReport(**result["trust"]),
+        timings      = result["timings"],
+        chunks_found = result["chunks_found"],
     )

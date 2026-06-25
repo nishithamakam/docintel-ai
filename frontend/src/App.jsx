@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { Sparkles } from 'lucide-react'
 import UploadPanel from './components/UploadPanel'
 import ChatWindow from './components/ChatWindow'
 import SourceViewer from './components/SourceViewer'
@@ -6,15 +7,13 @@ import SourceViewer from './components/SourceViewer'
 function App() {
   const [uploadedDocs, setUploadedDocs] = useState([])
   const [sources, setSources] = useState([])
-  const [selectedDocIds, setSelectedDocIds] = useState([])  // ← NEW
+  const [selectedDocIds, setSelectedDocIds] = useState([])
 
-  // After upload: add doc AND auto-select it
   const handleUploadSuccess = (newDoc) => {
     setUploadedDocs((prev) => [...prev, newDoc])
-    setSelectedDocIds((prev) => [...prev, newDoc.doc_id])  // auto-select
+    setSelectedDocIds((prev) => [...prev, newDoc.doc_id])
   }
 
-  // Toggle a doc's selection state
   const handleToggleDoc = (docId) => {
     setSelectedDocIds((prev) =>
       prev.includes(docId)
@@ -30,9 +29,14 @@ function App() {
   return (
     <div className="app-layout">
       <header className="app-header">
-        <h1>🧠 DocIntel AI</h1>
-        <span className="app-subtitle">Enterprise Document Intelligence</span>
+        <div className="brand">
+          <div className="brand-mark">
+            <Sparkles size={16} strokeWidth={2} />
+          </div>
+          <h1>Document Intelligence</h1>
+        </div>
       </header>
+
 
       <div className="app-main">
         <UploadPanel
@@ -45,7 +49,7 @@ function App() {
         <ChatWindow
           onSourcesUpdate={handleSourcesUpdate}
           hasDocuments={uploadedDocs.length > 0}
-          selectedDocIds={selectedDocIds}    // ← pass to chat
+          selectedDocIds={selectedDocIds}
         />
 
         <SourceViewer sources={sources} />
